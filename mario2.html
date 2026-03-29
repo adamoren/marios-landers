@@ -1,0 +1,874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mario's Landers - World 1-2</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0; padding: 0;
+            background: #050510;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+        canvas {
+            image-rendering: pixelated;
+            box-shadow: 0 0 40px rgba(80,40,120,0.5), 0 0 80px rgba(0,0,0,0.9);
+        }
+    </style>
+</head>
+<body>
+<canvas id="gameCanvas" width="800" height="480"></canvas>
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const TILE = 32;
+const WW = 1600, WH = 896;
+const GRAVITY = 1400, MAX_FALL = 600;
+const WALK = 200, RUN = 320, JUMP_V = -560;
+const STATE = { TITLE:0, PLAYING:1, DYING:2, WIN:3, GAME_OVER:4 };
+let gameState = STATE.TITLE;
+
+// ── Audio ──────────────────────────────────────────────────────────────────
+let audioCtx = null;
+function ensureAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+function playSfx(freq, type, dur, vol=0.1, slide=0) {
+    if (!audioCtx || audioCtx.state==='suspended') return;
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, audioCtx.currentTime);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(1,freq+slide), audioCtx.currentTime+dur);
+    g.gain.setValueAtTime(vol, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime+dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime+dur);
+}
+let bgmInterval = null;
+function playBgm() {
+    if (bgmInterval) clearInterval(bgmInterval);
+    const notes = [220,0,220,0,196,220,0,261,0,311,0,349,0,330,0,261,0];
+    let step = 0;
+    bgmInterval = setInterval(()=>{
+        if (gameState !== STATE.PLAYING) return;
+        const f = notes[step++ % notes.length];
+        if (f) playSfx(f,'square',0.15,0.03);
+    }, 180);
+}
+
+// ── Input ──────────────────────────────────────────────────────────────────
+const keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true; ensureAudio();
+    if (gameState===STATE.TITLE && (e.code==='Enter'||e.code==='Space')) { startGame(); if(player) player.jumpConsumed=true; }
+    if (e.code==='Escape') {
+        if(bgmInterval){ clearInterval(bgmInterval); bgmInterval=null; }
+        window.location.href='https://mario.apine.net';
+    }
+    if ((gameState===STATE.GAME_OVER||gameState===STATE.WIN) && (e.code==='Enter'||e.code==='Space')) {
+        gameState=STATE.TITLE; if(bgmInterval){ clearInterval(bgmInterval); bgmInterval=null; }
+    }
+    if (gameState===STATE.PLAYING && e.code==='KeyB' && player) player.shoot();
+    if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', e => keys[e.code]=false);
+
+// ── State ──────────────────────────────────────────────────────────────────
+let player=null, entities=[], particles=[];
+let levelTiles=[], pipes=[], boxes=[];
+let camera={x:0,y:608}, score=0, coins=0, lives=3;
+
+// ── Entity Base ────────────────────────────────────────────────────────────
+class Entity {
+    constructor(x,y,w,h) { this.x=x;this.y=y;this.w=w;this.h=h;this.vx=0;this.vy=0;this.grounded=false;this.dead=false; }
+    get midX(){return this.x+this.w/2;}
+    get midY(){return this.y+this.h/2;}
+    solid(r,c) {
+        if (!levelTiles[r]) return false;
+        return levelTiles[r][c]===1||levelTiles[r][c]===2;
+    }
+    update(dt) {
+        this.vy = Math.min(this.vy + GRAVITY*dt, MAX_FALL);
+        this.x += this.vx*dt; this.collideX();
+        this.y += this.vy*dt; this.collideY();
+    }
+    collideX() {
+        const l=Math.floor(this.x/TILE), r=Math.floor((this.x+this.w)/TILE);
+        const t=Math.floor(this.y/TILE), b=Math.floor((this.y+this.h-1)/TILE);
+        for (let row=t;row<=b;row++) {
+            if (this.solid(row,l)) { this.x=(l+1)*TILE; this.vx=Math.abs(this.vx); this.onWallHit(); }
+            if (this.solid(row,r)) { this.x=r*TILE-this.w; this.vx=-Math.abs(this.vx); this.onWallHit(); }
+        }
+    }
+    collideY() {
+        this.grounded=false;
+        const l=Math.floor(this.x/TILE), r=Math.floor((this.x+this.w-1)/TILE);
+        const t=Math.floor(this.y/TILE), b=Math.floor((this.y+this.h)/TILE);
+        for (let c=l;c<=r;c++) {
+            if (this.solid(b,c)) { this.y=b*TILE-this.h; this.vy=0; this.grounded=true; }
+            if (this.solid(t,c)) { this.y=(t+1)*TILE; this.vy=0; this.onHeadBump(c,t); }
+        }
+    }
+    onHeadBump(tx,ty){}
+    onWallHit(){}
+}
+
+// ── Mario ──────────────────────────────────────────────────────────────────
+class Mario extends Entity {
+    constructor(x,y){
+        super(x,y,22,30);
+        this.isBig=false; this.hasFire=false; this.invuln=0;
+        this.pipeState='none'; this.pipeTimer=0; this.targetPipe=null;
+        this.jumpConsumed=false; this.facing=1; this.walkFrame=0; this.walkT=0;
+        this.stompCombo=0;
+    }
+    update(dt){
+        if (this.invuln>0) this.invuln-=dt;
+        if (this.grounded) this.stompCombo=0;
+
+        if (this.pipeState!=='none') {
+            this.pipeTimer-=dt;
+            if (this.pipeState==='sinking') this.y+=90*dt;
+            else if (this.pipeState==='emerging') this.y-=90*dt;
+            if (this.pipeTimer<=0) {
+                if (this.pipeState==='sinking') {
+                    this.x=this.targetPipe.destX; this.y=this.targetPipe.destY;
+                    this.pipeState='emerging'; this.pipeTimer=0.4;
+                } else { this.pipeState='none'; this.vy=0; }
+            }
+            return;
+        }
+
+        const speed = (keys['ShiftLeft']||keys['ShiftRight']) ? RUN : WALK;
+        if (keys['ArrowLeft']||keys['KeyA']) { this.vx=-speed; this.facing=-1; }
+        else if (keys['ArrowRight']||keys['KeyD']) { this.vx=speed; this.facing=1; }
+        else this.vx=0;
+
+        if (this.vx!==0 && this.grounded) { this.walkT+=dt; if(this.walkT>0.12){this.walkFrame^=1;this.walkT=0;} }
+        else if (!this.grounded) this.walkFrame=1;
+
+        const wj = keys['ArrowUp']||keys['Space']||keys['KeyW'];
+        if (wj && !this.jumpConsumed && this.grounded) {
+            this.vy=JUMP_V; this.grounded=false; this.jumpConsumed=true;
+            playSfx(220,'sine',0.12,0.1,380);
+        }
+        if (!wj) this.jumpConsumed=false;
+        if (!wj && this.vy<-180) this.vy+=GRAVITY*dt*1.6;
+
+        super.update(dt);
+        this.h = (this.isBig || this.hasFire) ? 46 : 30;
+
+        // Pipe entry — rim tiles are at p.ty-1; check both pipe columns
+        if (this.grounded && (keys['ArrowDown']||keys['KeyS'])) {
+            const tx=Math.floor(this.midX/TILE);
+            const ty=Math.floor((this.y+this.h+2)/TILE);
+            pipes.forEach(p=>{
+                if ((tx===p.tx||tx===p.tx-1) && ty===p.ty-1) {
+                    this.pipeState='sinking'; this.pipeTimer=0.4;
+                    this.targetPipe=p; this.vx=0;
+                    playSfx(80,'square',0.5,0.12,200);
+                }
+            });
+        }
+        if (this.x<0) this.x=0;
+        if (this.x>WW-this.w) this.x=WW-this.w;
+        if (this.y>WH) this.die(true);
+
+        if (this.x>1530 && this.y<300) {
+            gameState=STATE.WIN;
+            playSfx(523,'sine',0.15,0.12); setTimeout(()=>playSfx(659,'sine',0.15,0.12),150);
+            setTimeout(()=>playSfx(784,'sine',0.3,0.12),300);
+        }
+    }
+    shoot(){
+        if(!this.hasFire || this.pipeState!=='none') return;
+        const active = entities.filter(e=>e instanceof Fireball).length;
+        if(active < 2){
+            entities.push(new Fireball(this.x+(this.facing>0?22:-10), this.y+12, this.facing));
+            playSfx(600,'square',0.08,0.1,-400);
+        }
+    }
+    onHeadBump(tx,ty){
+        boxes.forEach(b=>{ if(b.tx===tx&&b.ty===ty&&!b.hit) b.trigger(); });
+    }
+    die(insta=false){
+        if(gameState===STATE.DYING||gameState===STATE.GAME_OVER) return;
+        if(!insta && (this.isBig || this.hasFire)){
+            if(this.hasFire) this.hasFire=false; else this.isBig=false;
+            this.invuln=1.5;
+            playSfx(300,'square',0.1,0.1,-100); setTimeout(()=>playSfx(200,'square',0.1,0.1,-80),120);
+            return;
+        }
+        lives--; gameState=STATE.DYING;
+        playSfx(400,'sawtooth',0.6,0.15,-350);
+        setTimeout(()=>{ if(lives<=0) gameState=STATE.GAME_OVER; else resetLevel(); }, 1600);
+    }
+    draw(ctx){
+        if (this.invuln>0 && Math.floor(Date.now()/80)%2===0) return;
+        ctx.save();
+        ctx.translate(Math.floor(this.x+this.w/2), Math.floor(this.y));
+        if (this.facing===-1) ctx.scale(-1,1);
+        const big = this.isBig || this.hasFire;
+        const H = this.h;
+        const lo = (this.grounded && this.vx!==0) ? (this.walkFrame ? 3 : -1) : 0;
+        // Shoes
+        ctx.fillStyle='#3d1c02';
+        ctx.fillRect(-10,H-7+lo,10,7); ctx.fillRect(1,H-7-lo,10,7);
+        // Overall legs
+        ctx.fillStyle = this.hasFire ? '#eee' : '#1a3fcc';
+        ctx.fillRect(-9,H-14+lo,9,8); ctx.fillRect(1,H-14-lo,9,8);
+        // Overall bib
+        ctx.fillRect(-8,big?18:14,16,big?14:10);
+        ctx.fillRect(-6,big?10:7,3,10); ctx.fillRect(3,big?10:7,3,10);
+        // Shirt
+        ctx.fillStyle='#cc2200';
+        ctx.fillRect(-11,big?14:10,7,big?10:8); ctx.fillRect(4,big?14:10,7,big?10:8);
+        // Face
+        ctx.fillStyle='#f5c499'; ctx.fillRect(-7,8,14,9); ctx.fillRect(-9,9,3,5);
+        // Cap (white if fire mario)
+        ctx.fillStyle = this.hasFire ? '#fff' : '#cc2200';
+        ctx.fillRect(-9,0,18,5); ctx.fillRect(-7,-5,15,6);
+        ctx.fillStyle='#1a0800'; ctx.fillRect(0,9,5,4);
+        // Fire flower icon on cap if hasFire
+        if(this.hasFire){ ctx.fillStyle='#ff6600'; ctx.beginPath(); ctx.arc(4,-3,3,0,Math.PI*2); ctx.fill(); }
+        ctx.restore();
+    }
+}
+
+// ── Goomba ─────────────────────────────────────────────────────────────────
+class Goomba extends Entity {
+    constructor(x,y){ super(x,y,28,28); this.vx=-60; this.walkF=0; this.walkT=0; }
+    update(dt){
+        if(this.dead) return;
+        this.walkT+=dt; if(this.walkT>0.25){this.walkF^=1;this.walkT=0;}
+        super.update(dt);
+        const nx=this.vx>0?this.x+this.w+2:this.x-2;
+        const ltx=Math.floor(nx/TILE), lty=Math.floor((this.y+this.h+2)/TILE);
+        if(!levelTiles[lty]||levelTiles[lty][ltx]===0) this.vx*=-1;
+
+        if(rectHit(this,player)){
+            if(player.vy>=0 && player.y+player.h < this.y+this.h-4) {
+                this.dead=true; player.vy=-400; player.stompCombo++;
+                score += 200 * player.stompCombo;
+                spawnParticles(this.midX,this.midY,'#a05020',8);
+                playSfx(120,'square',0.15,0.12,-60);
+            } else if(player.invuln<=0 && player.pipeState==='none') {
+                player.die(true);
+            }
+        }
+    }
+    draw(ctx){
+        if(this.dead) return;
+        const wx = this.walkF===0 ? 0 : 2;
+        // Feet
+        ctx.fillStyle='#3d1800';
+        ctx.fillRect(this.x+1,this.y+22-wx,10,7); ctx.fillRect(this.x+17,this.y+22+wx,10,7);
+        // Body
+        ctx.fillStyle='#8b4513'; ctx.beginPath(); ctx.roundRect(this.x+3,this.y+10,22,18,5); ctx.fill();
+        // Head
+        ctx.fillStyle='#a0521e'; ctx.beginPath(); ctx.ellipse(this.midX,this.y+10,13,12,0,0,Math.PI*2); ctx.fill();
+        // Brows
+        ctx.strokeStyle='#2a0a00'; ctx.lineWidth=2.5;
+        ctx.beginPath(); ctx.moveTo(this.x+4,this.y+4); ctx.lineTo(this.x+11,this.y+9); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(this.x+24,this.y+4); ctx.lineTo(this.x+17,this.y+9); ctx.stroke();
+        // Eyes
+        ctx.fillStyle='#ffe0c0'; ctx.fillRect(this.x+4,this.y+7,6,6); ctx.fillRect(this.x+18,this.y+7,6,6);
+        ctx.fillStyle='#111'; ctx.fillRect(this.x+5,this.y+8,4,4); ctx.fillRect(this.x+19,this.y+8,4,4);
+        ctx.fillStyle='#fff'; ctx.fillRect(this.x+7,this.y+8,2,2); ctx.fillRect(this.x+21,this.y+8,2,2);
+        // Fangs
+        ctx.fillStyle='#fff'; ctx.fillRect(this.x+7,this.y+17,3,4); ctx.fillRect(this.x+18,this.y+17,3,4);
+    }
+}
+
+// ── Koopa Troopa ───────────────────────────────────────────────────────────
+class Koopa extends Entity {
+    constructor(x,y){
+        super(x,y,28,34);
+        this.vx=-50; this.state='walking';
+    }
+    update(dt){
+        if(this.dead) return;
+
+        // FIX: Always apply gravity; only suppress movement for stationary shell
+        if(this.state==='shell'){
+            // Apply gravity only (no horizontal movement)
+            this.vy = Math.min(this.vy + GRAVITY*dt, MAX_FALL);
+            this.y += this.vy*dt; this.collideY();
+        } else {
+            super.update(dt);
+        }
+
+        if(this.state==='walking'){
+            const nx=this.vx>0?this.x+this.w+2:this.x-2;
+            const ltx=Math.floor(nx/TILE), lty=Math.floor((this.y+this.h+2)/TILE);
+            if(!levelTiles[lty]||levelTiles[lty][ltx]===0) this.vx*=-1;
+        }
+
+        if(rectHit(this,player)){
+            if(player.vy>=0 && player.y+player.h < this.y+this.h-6){
+                if(this.state==='walking'){
+                    this.state='shell'; this.vx=0; this.vy=0;
+                    player.vy=-400; score+=200;
+                    spawnParticles(this.midX,this.midY,'#32CD32',6);
+                    playSfx(180,'sine',0.15,0.12,-80);
+                } else if(this.state==='shell'){
+                    this.kick(player.midX < this.midX ? 1 : -1);
+                    player.vy=-300;
+                } else if(this.state==='sliding'){
+                    this.state='shell'; this.vx=0; this.vy=0; player.vy=-300;
+                }
+            } else if(player.invuln<=0 && player.pipeState==='none'){
+                if(this.state==='walking' || this.state==='sliding'){
+                    player.die(true);
+                }
+                // shell (stationary): safe to walk past
+            }
+        }
+
+        if(this.state==='sliding'){
+            entities.forEach(e=>{
+                if(e!==this && (e instanceof Goomba || e instanceof Koopa) && !e.dead && rectHit(this,e)){
+                    e.dead=true; score+=500;
+                    spawnParticles(e.midX,e.midY,'#a05020',8);
+                    playSfx(300,'square',0.1,0.1,-150);
+                }
+            });
+        }
+    }
+    onWallHit(){
+        if(this.state==='sliding'){
+            playSfx(400,'square',0.05,0.08);
+        }
+    }
+    kick(dir){
+        this.state='sliding'; this.vx=dir*350;
+        playSfx(500,'square',0.05,0.1);
+    }
+    draw(ctx){
+        ctx.save();
+        if(this.state==='walking'){
+            // Yellow body behind shell
+            ctx.fillStyle='#e8c000';
+            ctx.fillRect(this.x+6,this.y+18,16,16);
+            // Green shell
+            ctx.fillStyle='#2db82d';
+            ctx.beginPath(); ctx.roundRect(this.x+2,this.y+10,24,22,8); ctx.fill();
+            ctx.fillStyle='#1a8a1a';
+            ctx.beginPath(); ctx.roundRect(this.x+5,this.y+13,18,16,5); ctx.fill();
+            ctx.strokeStyle='#0a5a0a'; ctx.lineWidth=1;
+            ctx.strokeRect(this.x+8,this.y+16,12,10);
+            // Orange feet
+            ctx.fillStyle='#e87000';
+            ctx.fillRect(this.x+2,this.y+28,9,6); ctx.fillRect(this.x+17,this.y+28,9,6);
+            // Yellow head
+            ctx.fillStyle='#e8c000';
+            const hx = this.vx<=0 ? this.x+1 : this.x+19;
+            ctx.beginPath(); ctx.roundRect(hx,this.y+2,9,12,3); ctx.fill();
+            // Eye
+            ctx.fillStyle='#111'; ctx.fillRect(hx+2,this.y+4,4,4);
+            ctx.fillStyle='#fff'; ctx.fillRect(hx+3,this.y+5,2,2);
+        } else {
+            // Shell only (shell / sliding states)
+            ctx.fillStyle='#2db82d';
+            ctx.beginPath(); ctx.roundRect(this.x+2,this.y+12,24,22,10); ctx.fill();
+            ctx.fillStyle='#1a8a1a';
+            ctx.beginPath(); ctx.roundRect(this.x+5,this.y+15,18,16,5); ctx.fill();
+            ctx.strokeStyle='#0a5a0a'; ctx.lineWidth=1.5;
+            // Hex lines on shell
+            ctx.strokeRect(this.x+8,this.y+18,12,10);
+            ctx.beginPath(); ctx.moveTo(this.x+14,this.y+15); ctx.lineTo(this.x+14,this.y+31); ctx.stroke();
+            if(this.state==='sliding'){
+                // Motion lines
+                ctx.strokeStyle='rgba(255,255,200,0.6)'; ctx.lineWidth=2;
+                const dir = this.vx > 0 ? -1 : 1;
+                for(let i=1;i<=3;i++){
+                    ctx.beginPath();
+                    ctx.moveTo(this.midX+dir*i*8,this.y+18); ctx.lineTo(this.midX+dir*i*8,this.y+30);
+                    ctx.stroke();
+                }
+            }
+        }
+        ctx.restore();
+    }
+}
+
+// ── Fireball ───────────────────────────────────────────────────────────────
+class Fireball extends Entity {
+    constructor(x,y,dir){
+        super(x,y,12,12); this.vx=dir*300; this.vy=-50;
+    }
+    update(dt){
+        super.update(dt);
+        if(this.grounded) this.vy=-260; // bounce
+        if(this.x<camera.x-32 || this.x>camera.x+832 || this.y>WH) this.dead=true;
+        entities.forEach(e=>{
+            if(e.dead || !rectHit(this,e)) return;
+            if(e instanceof Goomba){
+                e.dead=true; this.dead=true; score+=100;
+                playSfx(350,'square',0.06,0.1,-100);
+                spawnParticles(this.midX,this.midY,'#ff6600',5);
+            } else if(e instanceof Koopa && e.state!=='sliding'){
+                // FIX: Fireball shells a koopa instead of killing it
+                if(e.state==='walking') score+=200;
+                e.state='shell'; e.vx=0; e.vy=0;
+                this.dead=true;
+                playSfx(350,'square',0.06,0.1,-100);
+                spawnParticles(this.midX,this.midY,'#32CD32',5);
+            }
+        });
+    }
+    onWallHit(){ this.dead=true; playSfx(350,'square',0.05,0.05,-100); }
+    draw(ctx){
+        const pulse = Math.sin(Date.now()/60)*2;
+        ctx.fillStyle='#ff4400';
+        ctx.beginPath(); ctx.arc(this.midX,this.midY,6+pulse*0.3,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle='#ffcc00';
+        ctx.beginPath(); ctx.arc(this.midX,this.midY,3,0,Math.PI*2); ctx.fill();
+    }
+}
+
+// ── Danger Ball ────────────────────────────────────────────────────────────
+class DangerBall {
+    // FIX: Not an Entity — static hazard placed exactly on the floor
+    constructor(x,y){ this.x=x; this.y=y; this.w=40; this.h=40; }
+    get midX(){ return this.x+this.w/2; }
+    get midY(){ return this.y+this.h/2; }
+    update(dt){
+        // Static hazard — instant death on touch, even if Big Mario
+        if(rectHit(this,player)) player.die(true);
+    }
+    draw(ctx){
+        const t = Date.now()/150;
+        const pulse = Math.sin(t)*4;
+        const r = 20+pulse;
+        // Outer glow
+        const grad = ctx.createRadialGradient(this.midX,this.midY,2,this.midX,this.midY,r+6);
+        grad.addColorStop(0,'rgba(255,80,0,0.9)');
+        grad.addColorStop(0.5,'rgba(200,0,0,0.6)');
+        grad.addColorStop(1,'rgba(100,0,0,0)');
+        ctx.fillStyle=grad;
+        ctx.beginPath(); ctx.arc(this.midX,this.midY,r+6,0,Math.PI*2); ctx.fill();
+        // Body
+        ctx.fillStyle='#cc0000';
+        ctx.beginPath(); ctx.arc(this.midX,this.midY,r,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle='#ff2200';
+        ctx.beginPath(); ctx.arc(this.midX-4,this.midY-4,r*0.55,0,Math.PI*2); ctx.fill();
+        // Black hole center
+        ctx.fillStyle='#000';
+        ctx.beginPath(); ctx.arc(this.midX,this.midY,6,0,Math.PI*2); ctx.fill();
+        // Warning !
+        ctx.fillStyle='#fff';
+        ctx.font='bold 16px monospace'; ctx.textAlign='center';
+        ctx.shadowColor='#f00'; ctx.shadowBlur=8;
+        ctx.fillText('!',this.midX,this.y-8);
+        ctx.shadowBlur=0;
+    }
+}
+
+// ── Item ───────────────────────────────────────────────────────────────────
+class Item extends Entity {
+    constructor(x,y,type){ super(x,y,24,24); this.type=type; this.vx=type==='star'?0:(type==='mushroom'?100:80); this.bobT=0; }
+    update(dt){
+        if(this.dead) return;
+        if(this.type==='star'){
+            // FIX: Stars bob instead of falling with gravity (matches Level 1)
+            this.bobT+=dt;
+            this.y += Math.sin(this.bobT*3)*0.5;
+        } else {
+            super.update(dt);
+        }
+        if(rectHit(this,player)) this.collect();
+    }
+    collect(){
+        this.dead=true;
+        if(this.type==='flower'){
+            player.hasFire=true; if(!player.isBig) player.isBig=true; score+=1000;
+            spawnParticles(player.midX,player.midY,'#ff6600',12);
+            [400,500,600,750,900].forEach((f,i)=>setTimeout(()=>playSfx(f,'sine',0.1,0.1),i*65));
+        } else if(this.type==='mushroom'){
+            player.isBig=true; score+=1000;
+            spawnParticles(player.midX,player.midY,'#ff4444',10);
+            [200,320,480].forEach((f,i)=>setTimeout(()=>playSfx(f,'sine',0.14,0.1,80),i*90));
+        } else if(this.type==='star'){
+            score+=500;
+            spawnParticles(player.midX,player.midY,'#FFD700',12);
+            [600,800,1000,1200].forEach((f,i)=>setTimeout(()=>playSfx(f,'sine',0.1,0.1),i*55));
+        }
+    }
+    draw(ctx){
+        if(this.dead) return;
+        if(this.type==='flower'){
+            // Green stem
+            ctx.fillStyle='#2a8a2a'; ctx.fillRect(this.midX-2,this.y+14,4,10);
+            // Petals
+            [[-6,-6],[6,-6],[0,-10],[8,0],[-8,0]].forEach(([ox,oy])=>{
+                ctx.fillStyle='#ff4400';
+                ctx.beginPath(); ctx.arc(this.midX+ox,this.y+12+oy,5,0,Math.PI*2); ctx.fill();
+            });
+            // Center
+            ctx.fillStyle='#fff';
+            ctx.beginPath(); ctx.arc(this.midX,this.y+12,5,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle='#ffcc00';
+            ctx.beginPath(); ctx.arc(this.midX,this.y+12,3,0,Math.PI*2); ctx.fill();
+        } else if(this.type==='mushroom'){
+            ctx.fillStyle='#ffe8d0'; ctx.fillRect(this.midX-5,this.y+12,10,12);
+            ctx.fillStyle='#cc1111';
+            ctx.beginPath(); ctx.arc(this.midX,this.y+12,12,Math.PI,0); ctx.fill();
+            ctx.fillStyle='#fff';
+            ctx.beginPath(); ctx.arc(this.midX-6,this.y+8,3,0,Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.arc(this.midX+5,this.y+9,3,0,Math.PI*2); ctx.fill();
+        } else if(this.type==='star'){
+            ctx.shadowColor='#FFD700'; ctx.shadowBlur=12;
+            drawStar(ctx,this.midX,this.midY,5,13,6,'#FFD700','#e0a000');
+            ctx.shadowBlur=0;
+        }
+    }
+}
+
+// ── Surprise Box ───────────────────────────────────────────────────────────
+class Box {
+    constructor(tx,ty,content='coin'){
+        this.tx=tx; this.ty=ty; this.hit=false; this.offsetY=0; this.content=content;
+    }
+    trigger(){
+        if(this.hit) return;
+        this.hit=true;
+        this.offsetY=-10; setTimeout(()=>{this.offsetY=-5;},80); setTimeout(()=>{this.offsetY=0;},160);
+        playSfx(440,'square',0.08,0.1);
+        if(this.content==='coin'){
+            coins++; score+=200;
+            spawnParticles(this.tx*TILE+16,this.ty*TILE-8,'#FFD700',6);
+            playSfx(880,'sine',0.12,0.1,440);
+        } else {
+            entities.push(new Item(this.tx*TILE+4,(this.ty-1)*TILE,this.content));
+        }
+    }
+    draw(ctx){
+        const px=this.tx*TILE, py=this.ty*TILE+this.offsetY, S=TILE-1;
+        if(this.hit){
+            ctx.fillStyle='#552222'; ctx.fillRect(px,py,S,S);
+            ctx.fillStyle='#441a1a'; ctx.fillRect(px+2,py+2,S-4,4);
+            ctx.strokeStyle='#331010'; ctx.lineWidth=2; ctx.strokeRect(px+1,py+1,S-2,S-2);
+        } else {
+            ctx.fillStyle='#cc7700'; ctx.fillRect(px,py,S,S);
+            ctx.fillStyle='#ffaa00'; ctx.fillRect(px+2,py+2,S-4,12);
+            ctx.fillStyle='#cc7700'; ctx.fillRect(px+2,py+S-6,S-4,4);
+            ctx.strokeStyle='#994400'; ctx.lineWidth=2; ctx.strokeRect(px+1,py+1,S-2,S-2);
+            ctx.fillStyle='rgba(255,255,255,0.25)'; ctx.fillRect(px+4,py+4,8,4);
+            ctx.fillStyle='#fff'; ctx.font='bold 20px Arial'; ctx.textAlign='center';
+            ctx.shadowColor='#000'; ctx.shadowBlur=3;
+            ctx.fillText('?',px+TILE/2,py+22); ctx.shadowBlur=0;
+        }
+    }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function rectHit(a,b){ return a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y; }
+function drawStar(ctx,cx,cy,pts,ro,ri,fill,stroke){
+    let rot=-Math.PI/2, step=Math.PI/pts;
+    ctx.beginPath();
+    for(let i=0;i<pts;i++){
+        ctx.lineTo(cx+Math.cos(rot)*ro,cy+Math.sin(rot)*ro); rot+=step;
+        ctx.lineTo(cx+Math.cos(rot)*ri,cy+Math.sin(rot)*ri); rot+=step;
+    }
+    ctx.closePath(); ctx.fillStyle=fill; ctx.fill();
+    if(stroke){ ctx.strokeStyle=stroke; ctx.lineWidth=1.5; ctx.stroke(); }
+}
+function spawnParticles(x,y,color,n){
+    for(let i=0;i<n;i++){
+        const a=Math.random()*Math.PI*2, s=Math.random()*110+50;
+        particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-60,color,age:0,life:0.5+Math.random()*0.3,r:2+Math.random()*4});
+    }
+}
+
+// ── Level Init ─────────────────────────────────────────────────────────────
+function initLevel(){
+    levelTiles=Array.from({length:28},()=>Array(50).fill(0));
+    // Three floors
+    for(let x=0;x<50;x++){ levelTiles[27][x]=1; levelTiles[18][x]=1; levelTiles[9][x]=1; }
+    // Boundary walls
+    for(let y=0;y<28;y++){ levelTiles[y][0]=1; levelTiles[y][49]=1; }
+
+    // Middle room: ascending staircase
+    for(let i=0;i<6;i++) for(let j=0;j<=i;j++) levelTiles[17-j][20+i]=1;
+    // Middle room: goomba stack platform
+    for(let x=28;x<35;x++) levelTiles[15][x]=1;
+
+    // Top room: pit before the flag forces a jump + floating platforms to bridge it
+    for(let x=36;x<=38;x++) levelTiles[9][x]=0;   // gap — 3-tile pit
+    for(let x=36;x<=38;x++) levelTiles[7][x]=1;   // floating bridge platform over pit
+    for(let x=41;x<=43;x++) levelTiles[6][x]=1;   // raised approach platform near flag
+
+    // Surprise boxes
+    boxes=[
+        new Box(4, 22,'flower'),  // Bottom — fire flower, floating (reachable from floor)
+        new Box(20,22,'coin'),    // Bottom — coin, floating after DangerBall
+        new Box(30,12,'coin'),    // Mid — coin: moved UP to row 12 (2 rows above goomba platform at 15)
+        new Box(26,12,'mushroom'),// Mid — mushroom: moved to col 26 row 12, outside staircase (staircase max col=25)
+        new Box(10, 5,'star'),    // Top — star (floating, reachable from floor)
+        new Box(30, 5,'coin'),    // Top — coin
+        new Box(44, 5,'coin'),    // Top — coin: moved to col 44 (col 43 was on raised platform at row 6)
+    ];
+    boxes.forEach(b=>levelTiles[b.ty][b.tx]=2);
+
+    // Pipes — rim at p.ty-1
+    pipes=[
+        {tx:45, ty:27, destX:100,  destY:500, id:'1'}, // Bottom → Mid
+        {tx:45, ty:18, destX:100,  destY:200, id:'2'}, // Mid → Top
+        {tx:5,  ty:18, destX:1400, destY:200, id:'3'}, // Mid left → Top right
+        {tx:45, ty:9,  destX:100,  destY:500, id:'4'}  // Top → Mid
+    ];
+    pipes.forEach(p=>{ levelTiles[p.ty-1][p.tx]=1; levelTiles[p.ty-1][p.tx-1]=1; });
+
+    resetLevel();
+}
+
+function resetLevel(){
+    // FIX: DangerBall y = floor(864) - height(40) = 824, placed exactly on floor
+    // FIX: Stacked goombas spread across x so Mario must stomp each separately
+    const floorBot = 27*TILE - 28; // bottom room floor y for goombas (28px tall)
+    const floorMid = 18*TILE - 28; // mid floor y
+
+    player = new Mario(80, 800);
+    entities = [
+        new Koopa(350, floorBot),
+        new DangerBall(540, 27*TILE - 40), // FIX: exactly on floor
+        // FIX: Stack spread by 16px each so they must be stomped one at a time
+        new Goomba(700, floorMid),
+        new Goomba(716, floorMid),
+        new Goomba(732, floorMid),
+        new Goomba(900, floorMid),
+        // Stars bob in mid-air (Item type 'star' uses bob, not gravity)
+        new Item(1100, 18*TILE - 90, 'star'),  // 90px above mid floor — easy jump
+        new Item(1200, 18*TILE - 90, 'star'),
+        new Item(1300, 18*TILE - 90, 'star'),
+        new Koopa(1350, 9*TILE - 34),
+        new Goomba(1280, 9*TILE - 28),
+        new Item(480, 9*TILE - 100, 'star'),   // 100px above top floor — easy jump
+        new Item(580, 9*TILE - 100, 'star')
+    ];
+    particles=[];
+    gameState=STATE.PLAYING;
+    playBgm();
+}
+
+function startGame(){ score=0; coins=0; lives=3; initLevel(); }
+
+// ── Game Loop ──────────────────────────────────────────────────────────────
+let lastTime=0;
+requestAnimationFrame(function loop(ts){
+    let dt=Math.min((ts-lastTime)/1000, 0.05); lastTime=ts;
+    if(gameState===STATE.PLAYING||gameState===STATE.DYING){
+        if(player) player.update(dt);
+        entities.forEach(e=>e.update&&e.update(dt));
+        entities=entities.filter(e=>!e.dead);
+        particles.forEach(p=>{ p.age+=dt; p.x+=p.vx*dt; p.y+=p.vy*dt; p.vy+=400*dt; });
+        particles=particles.filter(p=>p.age<p.life);
+        camera.x+=(player.x-400-camera.x)*8*dt;
+        camera.x=Math.max(0,Math.min(camera.x,WW-800));
+        let ty = player.y > 608 ? 608 : (player.y > 320 ? 320 : 0);
+        camera.y+=(ty-camera.y)*6*dt;
+    }
+    render();
+    requestAnimationFrame(loop);
+});
+
+// ── Tile Drawing ───────────────────────────────────────────────────────────
+function drawBrickTile(ctx,c,r){
+    const x=c*TILE, y=r*TILE;
+    // Brick body
+    ctx.fillStyle='#8B3A3A'; ctx.fillRect(x,y,TILE,TILE);
+    // Mortar lines
+    ctx.fillStyle='#6a2020';
+    ctx.fillRect(x,y+12,TILE,3);
+    ctx.fillRect(x,y+25,TILE,3);
+    // Staggered vertical mortar
+    ctx.fillRect(x+16,y,3,12);
+    ctx.fillRect(x+4,y+15,3,10);
+    ctx.fillRect(x+20,y+15,3,10);
+    ctx.fillRect(x+8,y,3,12);
+    // Highlight
+    ctx.fillStyle='rgba(255,200,200,0.12)'; ctx.fillRect(x,y,TILE,3);
+    ctx.strokeStyle='rgba(0,0,0,0.3)'; ctx.lineWidth=1;
+    ctx.strokeRect(x+0.5,y+0.5,TILE-1,TILE-1);
+}
+
+function drawPipeAt(ctx,p){
+    const px=(p.tx-1)*TILE, py=(p.ty-2)*TILE, W=TILE*2;
+    // Body
+    const bg=ctx.createLinearGradient(px,0,px+W,0);
+    bg.addColorStop(0,'#0c2a5a'); bg.addColorStop(0.3,'#1a4a8a');
+    bg.addColorStop(0.7,'#1a4a8a'); bg.addColorStop(1,'#081828');
+    ctx.fillStyle=bg; ctx.fillRect(px+6,py+TILE,W-12,TILE+2);
+    // Cap
+    const cg=ctx.createLinearGradient(px,0,px+W,0);
+    cg.addColorStop(0,'#08204a'); cg.addColorStop(0.25,'#2060aa');
+    cg.addColorStop(0.6,'#1850a0'); cg.addColorStop(1,'#050f28');
+    ctx.fillStyle=cg; ctx.fillRect(px,py,W,TILE);
+    // Shine
+    ctx.fillStyle='rgba(150,200,255,0.2)'; ctx.fillRect(px+4,py+3,W/3,TILE-6);
+    ctx.fillStyle='rgba(0,0,0,0.3)'; ctx.fillRect(px,py+TILE-4,W,4);
+    // Dark hole
+    ctx.fillStyle='#020a18'; ctx.fillRect(px+8,py+4,W-16,TILE-8);
+    // Pipe ID
+    ctx.fillStyle='rgba(180,220,255,0.9)'; ctx.font='bold 13px monospace'; ctx.textAlign='center';
+    ctx.fillText(p.id, px+W/2, py+22);
+}
+
+// ── Render ─────────────────────────────────────────────────────────────────
+function render(){
+    ctx.clearRect(0,0,800,480);
+
+    if(gameState===STATE.TITLE){
+        const bg=ctx.createLinearGradient(0,0,0,480);
+        bg.addColorStop(0,'#050510'); bg.addColorStop(1,'#1a0e30');
+        ctx.fillStyle=bg; ctx.fillRect(0,0,800,480);
+        // Decorative stars
+        ctx.fillStyle='rgba(255,255,255,0.6)';
+        [40,120,200,350,500,650,720,100,380,580].forEach((x,i)=>{
+            ctx.beginPath(); ctx.arc(x, 30+i*40, 1.5, 0, Math.PI*2); ctx.fill();
+        });
+        // Title box
+        ctx.fillStyle='rgba(255,255,255,0.05)';
+        ctx.beginPath(); ctx.roundRect(100,70,600,300,16); ctx.fill();
+        ctx.strokeStyle='rgba(100,60,180,0.6)'; ctx.lineWidth=2;
+        ctx.beginPath(); ctx.roundRect(100,70,600,300,16); ctx.stroke();
+
+        ctx.textAlign='center'; ctx.shadowColor='#6030c0'; ctx.shadowBlur=15;
+        ctx.font='bold 52px monospace'; ctx.fillStyle='#c090ff';
+        ctx.fillText("MARIO'S",400,138);
+        ctx.fillStyle='#ff6060'; ctx.fillText("LANDERS",400,192);
+        ctx.shadowBlur=0;
+        ctx.font='20px monospace'; ctx.fillStyle='#9988cc';
+        ctx.fillText("World 1-2 — Into the Shell",400,234);
+        ctx.font='13px monospace'; ctx.fillStyle='#7766aa';
+        ctx.fillText("Arrows/WASD move   W/Space jump   B throw fireball   Shift run",400,272);
+
+        if(Math.floor(Date.now()/540)%2===0){
+            ctx.font='bold 20px monospace'; ctx.fillStyle='#fff';
+            ctx.shadowColor='#8844ff'; ctx.shadowBlur=10;
+            ctx.fillText('▶  PRESS ENTER TO START  ◀',400,340);
+            ctx.shadowBlur=0;
+        }
+        return;
+    }
+
+    ctx.save();
+    ctx.translate(-Math.floor(camera.x),-Math.floor(camera.y));
+
+    // Cave backgrounds per zone
+    const caveBg=ctx.createLinearGradient(0,0,0,WH);
+    caveBg.addColorStop(0,'#050510'); caveBg.addColorStop(0.5,'#1a0830'); caveBg.addColorStop(1,'#050510');
+    ctx.fillStyle=caveBg; ctx.fillRect(0,0,WW,WH);
+    // Underground horizontal "depth" lines
+    ctx.strokeStyle='rgba(80,40,100,0.25)'; ctx.lineWidth=1;
+    for(let r=1;r<28;r++){ ctx.beginPath(); ctx.moveTo(0,r*TILE); ctx.lineTo(WW,r*TILE); ctx.stroke(); }
+
+    // Tiles (skip box positions)
+    const boxSet=new Set(boxes.map(b=>`${b.tx},${b.ty}`));
+    for(let r=0;r<28;r++){
+        for(let c=0;c<50;c++){
+            if(levelTiles[r][c]===1 && !boxSet.has(`${c},${r}`)) drawBrickTile(ctx,c,r);
+        }
+    }
+
+    // Pipes
+    pipes.forEach(p=>drawPipeAt(ctx,p));
+
+    // Boxes
+    ctx.textAlign='left';
+    boxes.forEach(b=>b.draw(ctx));
+
+    // Goal flag
+    ctx.fillStyle='#888'; ctx.fillRect(1554,20,5,256);
+    ctx.fillStyle='#bbb'; ctx.fillRect(1555,20,2,256);
+    ctx.fillStyle='#cc0000';
+    ctx.beginPath(); ctx.moveTo(1559,28); ctx.lineTo(1559,56); ctx.lineTo(1590,42); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#ff3333';
+    ctx.beginPath(); ctx.moveTo(1559,31); ctx.lineTo(1559,42); ctx.lineTo(1578,37); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#FFD700';
+    ctx.beginPath(); ctx.arc(1557,22,7,0,Math.PI*2); ctx.fill();
+
+    // Entities & player
+    entities.forEach(e=>e.draw(ctx));
+    if(player) player.draw(ctx);
+
+    // Particles
+    particles.forEach(p=>{
+        ctx.globalAlpha=1-p.age/p.life;
+        ctx.fillStyle=p.color;
+        ctx.beginPath(); ctx.arc(p.x,p.y,p.r||3,0,Math.PI*2); ctx.fill();
+    });
+    ctx.globalAlpha=1;
+
+    ctx.restore();
+
+    // Dying overlay
+    if(gameState===STATE.DYING){ ctx.fillStyle='rgba(0,0,0,0.35)'; ctx.fillRect(0,0,800,480); }
+
+    // ── HUD ──
+    ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,0,800,40);
+    ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.fillRect(0,38,800,2);
+
+    ctx.font='bold 15px monospace'; ctx.shadowColor='#000'; ctx.shadowBlur=4;
+    ctx.fillStyle='#aaa'; ctx.textAlign='left'; ctx.fillText('MARIO',16,14);
+    ctx.fillStyle='#fff'; ctx.fillText(score.toString().padStart(6,'0'),16,30);
+
+    ctx.fillStyle='#aaa'; ctx.fillText('COINS',120,14);
+    ctx.fillStyle='#FFD700';
+    ctx.beginPath(); ctx.arc(122,25,5,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.fillText(`×${String(coins).padStart(2,'0')}`,132,30);
+
+    ctx.fillStyle='#aaa'; ctx.textAlign='center'; ctx.fillText('WORLD 1-2',400,14);
+    ctx.fillStyle='#fff'; ctx.fillText('Into the Shell',400,30);
+
+    if(player && player.hasFire){
+        ctx.fillStyle='#ff6600';
+        ctx.fillText('🔥 FIRE MARIO',580,14);
+        const ammo = 2 - entities.filter(e=>e instanceof Fireball).length;
+        ctx.fillStyle='#ffaa66'; ctx.fillText(`[B] ●`.repeat(ammo),580,30);
+    }
+
+    // Lives
+    ctx.fillStyle='#aaa'; ctx.textAlign='right'; ctx.fillText('LIVES',784,14);
+    for(let i=0;i<3;i++){
+        const hx=728+i*18, hy=22;
+        ctx.fillStyle = i<lives ? '#ff3333' : '#555';
+        ctx.beginPath(); ctx.arc(hx-3,hy,5,0,Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(hx+3,hy,5,0,Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.moveTo(hx-8,hy+2); ctx.lineTo(hx,hy+12); ctx.lineTo(hx+8,hy+2); ctx.fill();
+    }
+    ctx.shadowBlur=0;
+
+    // ── Overlay screens ──
+    if(gameState===STATE.GAME_OVER){
+        ctx.fillStyle='rgba(0,0,0,0.8)'; ctx.fillRect(0,0,800,480);
+        ctx.textAlign='center'; ctx.shadowColor='#000'; ctx.shadowBlur=10;
+        ctx.font='bold 52px monospace'; ctx.fillStyle='#ff4444'; ctx.fillText('GAME OVER',400,210);
+        ctx.font='20px monospace'; ctx.fillStyle='#ccc'; ctx.fillText(`Score: ${score}`,400,260);
+        if(Math.floor(Date.now()/550)%2===0){ ctx.fillStyle='#fff'; ctx.fillText('ENTER — try again   ESC — world select',400,320); }
+        ctx.shadowBlur=0;
+    }
+    if(gameState===STATE.WIN){
+        const wg=ctx.createLinearGradient(0,0,0,480);
+        wg.addColorStop(0,'rgba(20,0,60,0.92)'); wg.addColorStop(1,'rgba(0,0,20,0.92)');
+        ctx.fillStyle=wg; ctx.fillRect(0,0,800,480);
+        for(let i=0;i<8;i++) drawStar(ctx,60+i*96,(i%2===0?70:130),5,18,8,'#FFD700');
+        ctx.textAlign='center'; ctx.shadowColor='#8844ff'; ctx.shadowBlur=20;
+        ctx.font='bold 58px monospace'; ctx.fillStyle='#c090ff'; ctx.fillText('LEVEL CLEAR!',400,180);
+        ctx.shadowBlur=0;
+        ctx.font='24px monospace'; ctx.fillStyle='#fff';
+        ctx.fillText(`Score: ${score}`,400,240); ctx.fillText(`Coins: ${coins}`,400,272);
+        if(Math.floor(Date.now()/550)%2===0){ ctx.font='20px monospace'; ctx.fillStyle='#c0a0ff'; ctx.fillText('ENTER — play again   ESC — world select',400,330); }
+    }
+}
+</script>
+</body>
+</html>

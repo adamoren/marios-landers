@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mario's Landers - World 1-3</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin:0; padding:0; background:#1a3a6a; display:flex; justify-content:center; align-items:center; height:100vh; overflow:hidden; }
+        canvas { image-rendering:pixelated; box-shadow:0 0 40px rgba(40,120,255,0.4),0 0 80px rgba(0,0,0,0.9); }
+    </style>
+</head>
+<body>
+<canvas id="gameCanvas" width="800" height="480"></canvas>
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const TILE = 32;
+const WW = 3584, WH = 576;
+const COLS = 112, ROWS = 18;
+const FLOOR_ROW = 17;
+const FLOOR_Y = FLOOR_ROW * TILE; // 544
+const GRAVITY = 1400, MAX_FALL = 600;
+const WALK = 220, RUN = 360, JUMP_V = -560;
+const DOWNHILL_X1 = 1280, DOWNHILL_X2 = 1760;
+const STOP_COL = 85; // always-fixed stop sign column — keep 8 tiles clear around it
+const WIN_X = 3510;
+const STATE = { TITLE:0, PLAYING:1, DYING:2, WIN:3, GAME_OVER:4 };
+let gameState = STATE.TITLE;
+let downhillIntensity = 0;
+
+// Floor holes — regenerated each run by resetLevel()
+let WIDE_PITS    = new Set();
+let POTHOLE_COLS = new Set();
+let ALL_HOLES    = new Set();
+
+// ── Audio ────────────────────────────────────────────────────────────────
+let audioCtx = null;
+function ensureAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    if (audioCtx.state==='suspended') audioCtx.resume();
+}
+function playSfx(freq,type,dur,vol=0.1,slide=0) {
+    if (!audioCtx||audioCtx.state==='suspended') return;
+    const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+    o.type=type;
+    o.frequency.setValueAtTime(freq, audioCtx.currentTime);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(1,freq+slide), audioCtx.currentTime+dur);
+    g.gain.setValueAtTime(vol, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime+dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime+dur);
+}
+let bgmInterval = null;
+function playBgm() {
+    if (bgmInterval) clearInterval(bgmInterval);
+    const notes = [330,0,392,0,523,0,392,330,0,294,0,330,0,262,0,0,
+                   392,0,523,0,659,0,523,392,0,349,0,392,0,330,0,0];
+    let step = 0;
+    bgmInterval = setInterval(()=>{
+        if (gameState!==STATE.PLAYING) return;
+        const f = notes[step++%notes.length];
+        if (f) playSfx(f,'square',0.1,0.022);
+    }, 140);
+}
+
+// ── Input ────────────────────────────────────────────────────────────────
+const keys = {};
+window.addEventListener('keydown', e=>{
+    keys[e.code]=true; ensureAudio();
+    if (gameState===STATE.TITLE && (e.code==='Enter'||e.code==='Space')) { startGame(); if(player) player.jumpConsumed=true; }
+    if (e.code==='Escape') { if(bgmInterval){clearInterval(bgmInterval);bgmInterval=null;} window.location.href='https://mario.apine.net'; }
+    if (gameState===STATE.WIN && (e.code==='Enter'||e.code==='Space')) {
+        gameState=STATE.TITLE; if(bgmInterval){clearInterval(bgmInterval);bgmInterval=null;}
+    }
+    if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', e=>keys[e.code]=false);
+
+// ── State ────────────────────────────────────────────────────────────────
+let player=null, entities=[], particles=[];
+let levelTiles=[];
+let camera={x:0, y:96};
+let score=0, bellCount=0;
+
+// ── Entity Base ──────────────────────────────────────────────────────────
+class Entity {
+    constructor(x,y,w,h){this.x=x;this.y=y;this.w=w;this.h=h;this.vx=0;this.vy=0;this.grounded=false;this.dead=false;}
+    get midX(){return this.x+this.w/2;}
+    get midY(){return this.y+this.h/2;}
+    solid(r,c){ if(!levelTiles[r]) return false; return levelTiles[r][c]===1; }
+    update(dt){
+        this.vy=Math.min(this.vy+GRAVITY*dt, MAX_FALL);
+        this.x+=this.vx*dt; this.collideX();
+        this.y+=this.vy*dt; this.collideY();
+    }
+    collideX(){
+        const l=Math.floor(this.x/TILE), r=Math.floor((this.x+this.w)/TILE);
+        const t=Math.floor(this.y/TILE), b=Math.floor((this.y+this.h-1)/TILE);
+        for(let row=t;row<=b;row++){
+            if(this.solid(row,l)){this.x=(l+1)*TILE; this.vx=Math.abs(this.vx); this.onWallHit();}
+            if(this.solid(row,r)){this.x=r*TILE-this.w; this.vx=-Math.abs(this.vx); this.onWallHit();}
+        }
+    }
+    collideY(){
+        this.grounded=false;
+        const l=Math.floor(this.x/TILE), r=Math.floor((this.x+this.w-1)/TILE);
+        const t=Math.floor(this.y/TILE), b=Math.floor((this.y+this.h)/TILE);
+        for(let c=l;c<=r;c++){
+            if(this.solid(b,c)){this.y=b*TILE-this.h; this.vy=0; this.grounded=true;}
+            if(this.solid(t,c)){this.y=(t+1)*TILE; this.vy=0;}
+        }
+    }
+    onWallHit(){}
+}
+
+// ── Mario (on bike) ──────────────────────────────────────────────────────
+class Mario extends Entity {
+    constructor(x,y){
+        super(x,y,24,30);
+        this.invuln=0; this.jumpConsumed=false; this.facing=1;
+        this.stompCombo=0; this.wheelRot=0; this.puddleBoost=0;
+    }
+    update(dt){
+        if(this.invuln>0) this.invuln-=dt;
+        if(this.puddleBoost>0) this.puddleBoost-=dt;
+        if(this.grounded) this.stompCombo=0;
+
+        const inDownhill = this.x>DOWNHILL_X1 && this.x<DOWNHILL_X2;
+        const speed=(keys['ShiftLeft']||keys['ShiftRight'])?RUN:WALK;
+
+        if(keys['ArrowLeft']||keys['KeyA']){ this.vx=-speed; this.facing=-1; }
+        else if(keys['ArrowRight']||keys['KeyD']){ this.vx=speed; this.facing=1; }
+        else {
+            // Downhill auto-roll: Mario accelerates forward even without input
+            if(inDownhill && this.grounded){
+                this.vx += 90*dt;
+                this.vx = Math.min(this.vx, 480);
+                this.vx = Math.max(this.vx, 80); // can't fully stop on downhill without pressing left
+                this.facing=1;
+            } else {
+                this.vx=0;
+            }
+        }
+
+        // On downhill, riding right gets a boost
+        if(inDownhill && this.grounded && (keys['ArrowRight']||keys['KeyD'])){
+            this.vx = Math.min(this.vx + 60*dt, 490);
+        }
+
+        if(this.grounded && Math.abs(this.vx)>10) this.wheelRot+=this.vx*dt*0.12;
+
+        const wj=keys['ArrowUp']||keys['Space']||keys['KeyW'];
+        if(wj && !this.jumpConsumed && this.grounded){
+            this.vy=JUMP_V; this.grounded=false; this.jumpConsumed=true;
+            playSfx(300,'sine',0.1,0.08,180);
+        }
+        if(!wj) this.jumpConsumed=false;
+        if(!wj && this.vy<-180) this.vy+=GRAVITY*dt*1.6;
+
+        super.update(dt);
+        if(this.x<0) this.x=0;
+        if(this.x>WW-this.w) this.x=WW-this.w;
+        if(this.y>WH) this.die(true);
+
+        if(this.x>WIN_X && this.grounded){
+            gameState=STATE.WIN;
+            [523,659,784,1047].forEach((f,i)=>setTimeout(()=>playSfx(f,'sine',0.25,0.12),i*150));
+        }
+    }
+    die(insta=false){
+        if(gameState===STATE.DYING) return;
+        if(!insta && this.invuln<=0){ this.invuln=1.5; playSfx(200,'sawtooth',0.2,0.1,-80); return; }
+        gameState=STATE.DYING;
+        playSfx(350,'sawtooth',0.5,0.15,-220);
+        setTimeout(()=>{ resetLevel(); },1600);
+    }
+    draw(ctx){
+        if(this.invuln>0 && Math.floor(Date.now()/80)%2===0) return;
+        ctx.save();
+        const cx=Math.floor(this.x+this.w/2);
+        const baseY=Math.floor(this.y+this.h);
+        ctx.translate(cx, baseY);
+        if(this.facing===-1) ctx.scale(-1,1);
+        const wr=this.wheelRot;
+        [-11,11].forEach(wx=>{
+            ctx.strokeStyle='#222'; ctx.lineWidth=3.5;
+            ctx.beginPath(); ctx.arc(wx,-9,9,0,Math.PI*2); ctx.stroke();
+            ctx.strokeStyle='#888'; ctx.lineWidth=1.5;
+            [0,Math.PI/2].forEach(a=>{
+                ctx.beginPath();
+                ctx.moveTo(wx+Math.cos(wr+a)*9,-9+Math.sin(wr+a)*9);
+                ctx.lineTo(wx-Math.cos(wr+a)*9,-9-Math.sin(wr+a)*9);
+                ctx.stroke();
+            });
+            ctx.fillStyle='#bbb'; ctx.beginPath(); ctx.arc(wx,-9,2.5,0,Math.PI*2); ctx.fill();
+        });
+        ctx.strokeStyle='#e87010'; ctx.lineWidth=2.5;
+        ctx.beginPath();
+        ctx.moveTo(-11,-9); ctx.lineTo(0,-22); ctx.lineTo(11,-9);
+        ctx.moveTo(0,-22); ctx.lineTo(-4,-27);
+        ctx.moveTo(-11,-9); ctx.lineTo(-4,-27);
+        ctx.stroke();
+        ctx.strokeStyle='#666'; ctx.lineWidth=2;
+        ctx.beginPath(); ctx.moveTo(11,-20); ctx.lineTo(9,-27); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(9,-27); ctx.lineTo(15,-27); ctx.lineTo(15,-24); ctx.stroke();
+        ctx.fillStyle='#5a2a08'; ctx.fillRect(-8,-29,9,3);
+        ctx.translate(-1,-29);
+        const H=26;
+        ctx.fillStyle='#1a3fcc'; ctx.fillRect(-6,H-10,5,10); ctx.fillRect(2,H-10,5,10);
+        ctx.fillStyle='#3d1c02'; ctx.fillRect(-8,H-4,7,5); ctx.fillRect(2,H-4,7,5);
+        ctx.fillStyle='#1a3fcc'; ctx.fillRect(-6,H-20,12,11);
+        ctx.fillStyle='#cc2200'; ctx.fillRect(-10,H-18,5,9); ctx.fillRect(5,H-18,5,9);
+        ctx.fillStyle='#f5c499'; ctx.fillRect(-5,H-29,10,9);
+        ctx.fillStyle='#cc2200'; ctx.fillRect(-7,H-36,14,5); ctx.fillRect(-5,H-41,12,6);
+        ctx.fillStyle='#1a0800'; ctx.fillRect(1,H-28,4,3);
+        ctx.restore();
+    }
+}
+
+// ── Snake ────────────────────────────────────────────────────────────────
+class Snake extends Entity {
+    constructor(x,y){ super(x,y,34,18); this.vx=-50; this.bobT=Math.random()*Math.PI*2; this.squished=false; this.squishTimer=0; }
+    update(dt){
+        if(this.dead) return;
+        if(this.squished){ this.squishTimer-=dt; if(this.squishTimer<=0) this.dead=true; return; }
+        this.bobT+=dt; super.update(dt);
+        const nx=this.vx>0?this.x+this.w+2:this.x-2;
+        const lty=Math.floor((this.y+this.h+2)/TILE), ltx=Math.floor(nx/TILE);
+        if(!levelTiles[lty]||levelTiles[lty][ltx]===0) this.vx*=-1;
+        if(rectHit(this,player)){
+            if(player.vy>=0 && player.y+player.h<this.y+this.h-4){
+                this.squished=true; this.squishTimer=0.4; player.vy=-380; player.stompCombo++;
+                score+=150*player.stompCombo; spawnParticles(this.midX,this.midY,'#3aaa3a',8);
+                playSfx(120,'square',0.14,0.1,-60);
+            } else if(player.invuln<=0){ player.die(true); }
+        }
+    }
+    draw(ctx){
+        if(this.dead) return;
+        ctx.save();
+        const wave=Math.sin(this.bobT*4)*2.5, flip=this.vx>0;
+        ctx.translate(this.x+(flip?this.w:0), this.y+18);
+        if(flip) ctx.scale(-1,1);
+        if(this.squished){
+            ctx.fillStyle='#2a7a2a'; ctx.beginPath(); ctx.ellipse(17,1,20,3,0,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle='#aadd88'; ctx.beginPath(); ctx.ellipse(17,1,10,1.5,0,0,Math.PI*2); ctx.fill();
+            [8,26].forEach(ex=>{ ctx.strokeStyle='#ff0'; ctx.lineWidth=1.2; ctx.beginPath(); ctx.moveTo(ex-3,-2); ctx.lineTo(ex+3,2); ctx.stroke(); ctx.beginPath(); ctx.moveTo(ex+3,-2); ctx.lineTo(ex-3,2); ctx.stroke(); });
+        } else {
+            ctx.fillStyle='#2d8c2d'; ctx.beginPath(); ctx.ellipse(6,-6+wave,7,6,0,0,Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(16,-4-wave,8,7,0,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle='#1a6a1a'; ctx.beginPath(); ctx.ellipse(26,-6+wave,10,8,0,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle='#aadd88'; ctx.beginPath(); ctx.ellipse(16,-6+wave*0.3,7,4,0,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle='#ff0'; ctx.beginPath(); ctx.arc(30,-8+wave,3,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle='#000'; ctx.beginPath(); ctx.arc(31,-8+wave,1.5,0,Math.PI*2); ctx.fill();
+            ctx.strokeStyle='#cc0000'; ctx.lineWidth=1.5;
+            ctx.beginPath(); ctx.moveTo(35,-6+wave); ctx.lineTo(39,-4+wave); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(35,-6+wave); ctx.lineTo(39,-8+wave); ctx.stroke();
+        }
+        ctx.restore();
+    }
+}
+
+// ── Rock ─────────────────────────────────────────────────────────────────
+class Rock {
+    constructor(x){ this.renderX=x; this.x=x+5; this.w=22; this.y=FLOOR_Y-26; this.h=26; }
+    get midX(){ return this.x+this.w/2; }
+    update(dt){
+        if(!player||player.invuln>0) return;
+        const hit=player.x<this.x+this.w&&player.x+player.w>this.x&&player.y<this.y+this.h&&player.y+player.h>this.y;
+        if(hit && player.y+player.h>this.y+18) player.die(true);
+    }
+    draw(ctx){
+        const x=this.renderX, y=this.y;
+        ctx.fillStyle='rgba(0,0,0,0.18)'; ctx.beginPath(); ctx.ellipse(x+16,y+28,15,4,0,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle='#787868';
+        ctx.beginPath(); ctx.moveTo(x+4,y+26); ctx.lineTo(x,y+16); ctx.lineTo(x+3,y+6); ctx.lineTo(x+9,y+1); ctx.lineTo(x+21,y); ctx.lineTo(x+29,y+6); ctx.lineTo(x+32,y+16); ctx.lineTo(x+28,y+26); ctx.closePath(); ctx.fill();
+        ctx.fillStyle='#9e9e8e'; ctx.beginPath(); ctx.moveTo(x+9,y+3); ctx.lineTo(x+7,y+12); ctx.lineTo(x+16,y+7); ctx.lineTo(x+21,y+2); ctx.closePath(); ctx.fill();
+        ctx.strokeStyle='#555'; ctx.lineWidth=1.5; ctx.beginPath(); ctx.moveTo(x+15,y+7); ctx.lineTo(x+19,y+18); ctx.stroke();
+        ctx.fillStyle='#ff4'; ctx.font='bold 11px monospace'; ctx.textAlign='center';
+        ctx.shadowColor='#f00'; ctx.shadowBlur=5; ctx.fillText('!',x+16,y-3); ctx.shadowBlur=0;
+    }
+}
+
+// ── Black Hole ───────────────────────────────────────────────────────────
+class BlackHole {
+    constructor(x){
+        this.renderX=x; this.x=x-8; this.w=44; this.y=FLOOR_Y-22; this.h=22;
+        this.rotT=Math.random()*Math.PI*2;
+    }
+    get midX(){ return this.renderX+14; }
+    update(dt){
+        this.rotT+=dt*2.2;
+        if(!player||player.invuln>0) return;
+        const hit=player.x<this.x+this.w&&player.x+player.w>this.x&&player.y<this.y+this.h&&player.y+player.h>this.y;
+        if(hit && player.y+player.h>this.y+8) player.die(true);
+    }
+    draw(ctx){
+        const cx=this.renderX+14, cy=this.y+11, t=this.rotT;
+        ctx.save();
+        ctx.shadowColor='#5500aa'; ctx.shadowBlur=22;
+        ctx.fillStyle='#000'; ctx.beginPath(); ctx.ellipse(cx,cy,24,12,0,0,Math.PI*2); ctx.fill();
+        ctx.shadowBlur=0;
+        [[0.88,0.9,'rgba(100,0,200,0.85)'],[0.66,0.8,'rgba(140,0,255,0.65)'],[0.42,0.7,'rgba(180,60,255,0.45)']].forEach(([rx,ry,color],i)=>{
+            ctx.strokeStyle=color; ctx.lineWidth=2;
+            ctx.beginPath(); ctx.ellipse(cx,cy,24*rx,12*ry,t+i*0.9,0,Math.PI*2); ctx.stroke();
+        });
+        const grd=ctx.createRadialGradient(cx,cy,0,cx,cy,9);
+        grd.addColorStop(0,'rgba(200,80,255,0.9)'); grd.addColorStop(1,'rgba(0,0,0,0)');
+        ctx.fillStyle=grd; ctx.beginPath(); ctx.ellipse(cx,cy,9,5,0,0,Math.PI*2); ctx.fill();
+        // Warning dots
+        const pulse=0.5+0.5*Math.sin(t*3);
+        ctx.fillStyle=`rgba(180,0,255,${pulse})`; ctx.font='bold 11px monospace'; ctx.textAlign='center';
+        ctx.shadowColor='#aa00ff'; ctx.shadowBlur=8;
+        ctx.fillText('\u26a0',cx,this.y-5); ctx.shadowBlur=0;
+        ctx.restore();
+    }
+}
+
+// ── Stop Sign ────────────────────────────────────────────────────────────
+class StopSign {
+    constructor(x){
+        this.x=x; this.signY=FLOOR_Y-140;
+        // painted "stop here" box: 150px wide, ending 20px before the post
+        this.boxX=x-170; this.boxW=150;
+        this.dangerX1=x-20; this.dangerX2=x+64;
+        this.flash=0; this.dead=false; this.cleared=false;
+    }
+    update(dt){
+        if(this.dead) return;
+        this.flash=Math.max(0,this.flash-dt*4);
+        if(!player) return;
+        const inDanger=player.x+player.w>this.dangerX1 && player.x<this.dangerX2;
+        const inBox=player.x+player.w/2>=this.boxX && player.x+player.w/2<=this.boxX+this.boxW;
+        if(inDanger && Math.abs(player.vx)>55){
+            this.flash=1;
+            if(player.invuln<=0) player.die(true);
+        } else if((inBox||inDanger) && !this.cleared && Math.abs(player.vx)<=10){
+            this.cleared=true;
+            spawnParticles(this.x+22, this.signY+25, '#ffdd00', 14);
+            playSfx(600,'sine',0.12,0.18,200);
+            setTimeout(()=>{ this.dead=true; }, 450);
+        }
+    }
+    draw(ctx){
+        if(this.dead) return;
+        const x=this.x, sy=this.signY;
+        const bx=this.boxX, bw=this.boxW;
+        const pulse=Math.sin(Date.now()*0.004)*0.5+0.5;
+
+        // ── Painted stop box on road ──────────────────────────────────────
+        if(!this.cleared){
+            // Yellow fill
+            ctx.fillStyle=`rgba(255,210,0,${0.22+0.1*pulse})`;
+            ctx.fillRect(bx, FLOOR_Y, bw, TILE);
+            // Diagonal hazard stripes
+            ctx.save(); ctx.beginPath(); ctx.rect(bx,FLOOR_Y,bw,TILE); ctx.clip();
+            ctx.strokeStyle=`rgba(255,255,255,${0.55+0.2*pulse})`; ctx.lineWidth=5;
+            for(let lx=bx-TILE;lx<bx+bw+TILE;lx+=24){
+                ctx.beginPath(); ctx.moveTo(lx,FLOOR_Y); ctx.lineTo(lx+TILE,FLOOR_Y+TILE); ctx.stroke();
+            }
+            ctx.restore();
+            // Left edge stop-line (thick white)
+            ctx.strokeStyle='#fff'; ctx.lineWidth=5;
+            ctx.beginPath(); ctx.moveTo(bx,FLOOR_Y); ctx.lineTo(bx,FLOOR_Y+TILE); ctx.stroke();
+            // "STOP HERE →" label above the box
+            ctx.save();
+            ctx.font='bold 11px monospace'; ctx.textAlign='center';
+            ctx.fillStyle=`rgba(255,230,0,${0.9+0.1*pulse})`;
+            ctx.shadowColor='#000'; ctx.shadowBlur=5;
+            ctx.fillText('\u25bc STOP HERE \u25bc', bx+bw/2, FLOOR_Y-6);
+            ctx.shadowBlur=0;
+            ctx.restore();
+        }
+
+        // ── Road "STOP" text ──────────────────────────────────────────────
+        for(let i=0;i<4;i++){
+            ctx.fillStyle=`rgba(200,40,40,${0.15+i*0.12})`;
+            ctx.font='bold 13px monospace'; ctx.textAlign='center';
+            ctx.fillText('STOP', x+22, FLOOR_Y+20);
+        }
+        // ── Post ──────────────────────────────────────────────────────────
+        ctx.fillStyle='#999'; ctx.fillRect(x+18,sy+50,8,90);
+        ctx.fillStyle='#bbb'; ctx.fillRect(x+19,sy+50,3,90);
+        // ── Octagon ───────────────────────────────────────────────────────
+        ctx.save();
+        ctx.translate(x+22,sy+25);
+        if(this.flash>0){ ctx.shadowColor='#ff0000'; ctx.shadowBlur=24*this.flash; }
+        ctx.fillStyle='#cc1111';
+        ctx.beginPath();
+        for(let i=0;i<8;i++){
+            const a=i*Math.PI/4-Math.PI/8;
+            i===0?ctx.moveTo(Math.cos(a)*24,Math.sin(a)*24):ctx.lineTo(Math.cos(a)*24,Math.sin(a)*24);
+        }
+        ctx.closePath(); ctx.fill();
+        ctx.strokeStyle='#fff'; ctx.lineWidth=3; ctx.stroke();
+        ctx.fillStyle='#fff'; ctx.font='bold 12px monospace'; ctx.textAlign='center';
+        ctx.fillText('STOP',0,4);
+        ctx.shadowBlur=0;
+        ctx.restore();
+    }
+}
+
+// ── Puddle ───────────────────────────────────────────────────────────────
+class Puddle {
+    constructor(x){ this.x=x; this.y=FLOOR_Y-7; this.w=70; this.h=9; this.t=Math.random()*Math.PI*2; }
+    update(dt){
+        this.t+=dt*2;
+        if(!player) return;
+        if(rectHit(this,player) && player.grounded && player.puddleBoost<=0){
+            player.puddleBoost=1.2;
+            // burst of speed in facing direction
+            player.vx = Math.sign(player.facing||1) * Math.max(Math.abs(player.vx)+120, 260);
+            spawnParticles(player.x+player.w/2, this.y, '#88ccff', 10);
+            playSfx(300,'sine',0.07,0.15,-60);
+        }
+    }
+    draw(ctx){
+        const x=this.x,y=this.y, rip=Math.sin(this.t*2.5)*1.5;
+        ctx.save();
+        ctx.fillStyle='rgba(50,90,200,0.7)';
+        ctx.beginPath(); ctx.ellipse(x+35,y+4,35,6+rip,0,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle='rgba(160,200,255,0.55)';
+        ctx.beginPath(); ctx.ellipse(x+24,y+2,10,2,-0.3,0,Math.PI*2); ctx.fill();
+        ctx.strokeStyle='rgba(100,160,220,0.45)'; ctx.lineWidth=1.5;
+        ctx.beginPath(); ctx.ellipse(x+35,y+4,30+rip,4+rip*0.4,0,0,Math.PI*2); ctx.stroke();
+        ctx.fillStyle='#88bbff'; ctx.font='10px monospace'; ctx.textAlign='center';
+        ctx.fillText('~\u2248~',x+35,y-5);
+        ctx.restore();
+    }
+}
+
+// ── Bell ─────────────────────────────────────────────────────────────────
+class Bell {
+    constructor(x,y){ this.x=x; this.y=y; this.w=20; this.h=22; this.dead=false; this.bobT=Math.random()*Math.PI*2; }
+    get midX(){ return this.x+this.w/2; } get midY(){ return this.y+this.h/2; }
+    update(dt){
+        if(this.dead) return; this.bobT+=dt*2.2;
+        if(rectHit(this,player)){ this.dead=true; bellCount++; score+=100; spawnParticles(this.midX,this.midY,'#FFD700',6); playSfx(880,'sine',0.12,0.08,220); setTimeout(()=>playSfx(1100,'sine',0.08,0.05),70); }
+    }
+    draw(ctx){
+        if(this.dead) return;
+        const bob=Math.sin(this.bobT)*3, bx=this.x, by=this.y+bob;
+        ctx.save(); ctx.shadowColor='#FFD700'; ctx.shadowBlur=10;
+        ctx.fillStyle='#FFD700';
+        ctx.beginPath(); ctx.moveTo(bx+10,by+22); ctx.lineTo(bx+1,by+13); ctx.bezierCurveTo(bx-1,by+5,bx+3,by,bx+10,by); ctx.bezierCurveTo(bx+17,by,bx+21,by+5,bx+19,by+13); ctx.closePath(); ctx.fill();
+        ctx.shadowBlur=0; ctx.fillStyle='rgba(255,255,200,0.7)'; ctx.beginPath(); ctx.ellipse(bx+6,by+7,3,2,-0.5,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle='#cc9900'; ctx.fillRect(bx+8,by-4,4,6);
+        ctx.fillStyle='#cc9900'; ctx.beginPath(); ctx.arc(bx+10,by+19,3,0,Math.PI*2); ctx.fill();
+        ctx.restore();
+    }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+function rectHit(a,b){ return a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y; }
+function spawnParticles(x,y,color,n){
+    for(let i=0;i<n;i++){
+        const a=Math.random()*Math.PI*2, s=Math.random()*110+50;
+        particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-60,color,age:0,life:0.5+Math.random()*0.3,r:2+Math.random()*4});
+    }
+}
+function drawStarShape(ctx,cx,cy,pts,ro,ri,fill){
+    let rot=-Math.PI/2,step=Math.PI/pts; ctx.beginPath();
+    for(let i=0;i<pts;i++){ctx.lineTo(cx+Math.cos(rot)*ro,cy+Math.sin(rot)*ro);rot+=step;ctx.lineTo(cx+Math.cos(rot)*ri,cy+Math.sin(rot)*ri);rot+=step;}
+    ctx.closePath(); ctx.fillStyle=fill; ctx.fill();
+}
+
+// ── Level ────────────────────────────────────────────────────────────────
+function initLevel(){ resetLevel(); }
+
+function resetLevel(){
+    const fy = FLOOR_Y - 18;
+    const DH1 = Math.floor(DOWNHILL_X1 / TILE); // 40
+    const DH2 = Math.ceil(DOWNHILL_X2 / TILE);  // 55
+    const MIN_GAP = 9; // minimum tiles between any two lethal obstacles
+
+    // ── Pick lethal obstacle columns with guaranteed spacing ─────────────
+    // Two safe ranges: pre-downhill and post-downhill, both with a buffer
+    const ranges = [[6, DH1 - 3], [DH2 + 3, 104]];
+    function pickCols(count, gap) {
+        const cols = [];
+        for (let t = 0; t < 3000 && cols.length < count; t++) {
+            const r = ranges[Math.floor(Math.random() * ranges.length)];
+            const c = r[0] + Math.floor(Math.random() * (r[1] - r[0] + 1));
+            if (Math.abs(c - STOP_COL) < 8) continue; // keep stop-sign zone clear
+            if (cols.every(x => Math.abs(x - c) >= gap)) cols.push(c);
+        }
+        return cols.sort((a, b) => a - b);
+    }
+    const numLethal = 8 + Math.floor(Math.random() * 4); // 8–11 lethal spots
+    const lethalCols = pickCols(numLethal, MIN_GAP);
+
+    // ── Assign types to each lethal column ───────────────────────────────
+    const typePool = ['rock','rock','rock','hole','hole','hole','pit','pit','pothole','pothole'];
+    const newPitCols = new Set(), newPotholeCols = new Set();
+    const rockXs = [], holeXs = [];
+    lethalCols.forEach(col => {
+        const t = typePool[Math.floor(Math.random() * typePool.length)];
+        if      (t === 'rock')    rockXs.push(col * TILE);
+        else if (t === 'hole')    holeXs.push(col * TILE);
+        else if (t === 'pit')   { newPitCols.add(col); newPitCols.add(col + 1); }
+        else                    newPotholeCols.add(col);
+    });
+
+    // Update global hole sets used by drawRoad
+    WIDE_PITS    = newPitCols;
+    POTHOLE_COLS = newPotholeCols;
+    ALL_HOLES    = new Set([...WIDE_PITS, ...POTHOLE_COLS]);
+
+    // ── Rebuild floor tiles ───────────────────────────────────────────────
+    levelTiles = Array.from({length: ROWS}, () => Array(COLS).fill(0));
+    for (let c = 0; c < COLS; c++) { if (!ALL_HOLES.has(c)) levelTiles[FLOOR_ROW][c] = 1; }
+    for (let r = 0; r < ROWS; r++) { levelTiles[r][0] = 1; levelTiles[r][COLS-1] = 1; }
+
+    // ── Snakes (stompable, avoid downhill and obstacle clusters) ─────────
+    const numSnakes = 8 + Math.floor(Math.random() * 5);
+    const snakeXs = [];
+    for (let t = 0; t < 2000 && snakeXs.length < numSnakes; t++) {
+        const x = 180 + Math.floor(Math.random() * (WIN_X - 500));
+        const col = Math.floor(x / TILE);
+        if (col >= DH1 && col <= DH2) continue;
+        if (Math.abs(col - STOP_COL) < 8) continue;
+        if (lethalCols.some(c => Math.abs(c - col) < 3)) continue;
+        if (snakeXs.every(sx => Math.abs(sx - x) > 230)) snakeXs.push(x);
+    }
+
+    // ── Puddles (non-lethal, 2–4) ─────────────────────────────────────────
+    const numPuddles = 2 + Math.floor(Math.random() * 3);
+    const puddleXs = [];
+    for (let t = 0; t < 500 && puddleXs.length < numPuddles; t++) {
+        const col = 8 + Math.floor(Math.random() * 98);
+        if (col >= DH1 && col <= DH2) continue;
+        if (Math.abs(col - STOP_COL) < 8) continue;
+        if (lethalCols.some(c => Math.abs(c - col) < 3)) continue;
+        if (puddleXs.every(px => Math.abs(px - col * TILE) > 500)) puddleXs.push(col * TILE);
+    }
+
+    // ── Ground bells (~20% chance per col, skip obstacle neighbours) ─────
+    const groundBells = [];
+    for (let col = 3; col < 110; col++) {
+        if (Math.random() < 0.20 && !lethalCols.some(c => Math.abs(c - col) < 2) && !ALL_HOLES.has(col))
+            groundBells.push(col);
+    }
+
+    // ── Floating bells (random stride 5–8 cols) ───────────────────────────
+    const floatBells = [];
+    for (let col = 8; col < 108; col += 5 + Math.floor(Math.random() * 4)) floatBells.push(col);
+
+    // ── Assemble ──────────────────────────────────────────────────────────
+    player = new Mario(80, FLOOR_Y - 30);
+    entities = [
+        ...snakeXs.map(x => new Snake(x, fy)),
+        ...rockXs.map(x => new Rock(x)),
+        ...holeXs.map(x => new BlackHole(x)),
+        new StopSign(85 * TILE),
+        ...puddleXs.map(x => new Puddle(x)),
+        ...groundBells.map(c => new Bell(c * TILE, FLOOR_Y - 48)),
+        ...floatBells.map(c => new Bell(c * TILE, FLOOR_Y - 130)),
+    ];
+    particles = []; gameState = STATE.PLAYING; playBgm();
+}
+
+function startGame(){ score=0; bellCount=0; initLevel(); }
+
+// ── Game Loop ────────────────────────────────────────────────────────────
+let lastTime=0;
+requestAnimationFrame(function loop(ts){
+    let dt=Math.min((ts-lastTime)/1000,0.05); lastTime=ts;
+    if(gameState===STATE.PLAYING||gameState===STATE.DYING){
+        if(player) player.update(dt);
+        entities.forEach(e=>e.update&&e.update(dt));
+        entities=entities.filter(e=>!e.dead);
+        particles.forEach(p=>{p.age+=dt;p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=400*dt;});
+        particles=particles.filter(p=>p.age<p.life);
+        camera.x+=(player.x-300-camera.x)*8*dt;
+        camera.x=Math.max(0,Math.min(camera.x,WW-800));
+        const t=Math.max(0,Math.min(1,(player.x-DOWNHILL_X1)/(DOWNHILL_X2-DOWNHILL_X1)));
+        downhillIntensity=player.x>DOWNHILL_X1&&player.x<DOWNHILL_X2?t:0;
+    }
+    render();
+    requestAnimationFrame(loop);
+});
+
+// ── Scene ────────────────────────────────────────────────────────────────
+function drawSky(){
+    // Sky darkens slightly on downhill
+    const di=downhillIntensity;
+    const g=ctx.createLinearGradient(0,0,0,FLOOR_Y);
+    g.addColorStop(0,`hsl(${220-di*18},${60+di*10}%,${28-di*6}%)`);
+    g.addColorStop(0.6,'#3388dd');
+    g.addColorStop(1,'#77bbff');
+    ctx.fillStyle=g; ctx.fillRect(0,0,WW,FLOOR_Y);
+}
+function drawCloud(cx,cy,s=1){
+    ctx.fillStyle='rgba(255,255,255,0.9)';
+    [[0,0,28],[22,-10,20],[44,0,24],[20,10,16],[-4,8,16]].forEach(([ox,oy,r])=>{ ctx.beginPath(); ctx.arc(cx+ox*s,cy+oy*s,r*s,0,Math.PI*2); ctx.fill(); });
+}
+function drawTree(tx){
+    ctx.fillStyle='#6b4820'; ctx.fillRect(tx+10,FLOOR_Y-70,10,70);
+    ctx.fillStyle='#1e6e18'; ctx.beginPath(); ctx.arc(tx+15,FLOOR_Y-90,28,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#28982a'; ctx.beginPath(); ctx.arc(tx+15,FLOOR_Y-100,20,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#44bb44'; ctx.beginPath(); ctx.arc(tx+15,FLOOR_Y-107,12,0,Math.PI*2); ctx.fill();
+}
+function drawValleyTerrain(){
+    // Two large hill mounds flanking the downhill zone — valley is open in between
+    const peakH = 290;  // how far above road the hill peaks
+
+    // ── Left hill mound (sloping down to the right into the valley) ──────
+    // Back shadow layer
+    ctx.fillStyle = '#172d0c';
+    ctx.beginPath();
+    ctx.moveTo(0, FLOOR_Y);
+    ctx.lineTo(0, FLOOR_Y - peakH - 30);
+    ctx.bezierCurveTo(
+        DOWNHILL_X1 - 200, FLOOR_Y - peakH - 30,
+        DOWNHILL_X1 - 80, FLOOR_Y - peakH * 0.6,
+        DOWNHILL_X1 - 40, FLOOR_Y - peakH * 0.2
+    );
+    ctx.bezierCurveTo(DOWNHILL_X1 - 10, FLOOR_Y - 20, DOWNHILL_X1, FLOOR_Y, DOWNHILL_X1, FLOOR_Y);
+    ctx.closePath();
+    ctx.fill();
+    // Front grass layer
+    ctx.fillStyle = '#2a6614';
+    ctx.beginPath();
+    ctx.moveTo(0, FLOOR_Y);
+    ctx.lineTo(0, FLOOR_Y - peakH);
+    ctx.bezierCurveTo(
+        DOWNHILL_X1 - 180, FLOOR_Y - peakH,
+        DOWNHILL_X1 - 60, FLOOR_Y - peakH * 0.5,
+        DOWNHILL_X1 - 20, FLOOR_Y - peakH * 0.12
+    );
+    ctx.bezierCurveTo(DOWNHILL_X1 - 5, FLOOR_Y - 8, DOWNHILL_X1, FLOOR_Y, DOWNHILL_X1, FLOOR_Y);
+    ctx.closePath();
+    ctx.fill();
+    // Bright grass edge
+    ctx.strokeStyle = '#44b020'; ctx.lineWidth = 6; ctx.lineJoin='round';
+    ctx.beginPath();
+    ctx.moveTo(0, FLOOR_Y - peakH);
+    ctx.bezierCurveTo(
+        DOWNHILL_X1 - 180, FLOOR_Y - peakH,
+        DOWNHILL_X1 - 60, FLOOR_Y - peakH * 0.5,
+        DOWNHILL_X1 - 20, FLOOR_Y - peakH * 0.12
+    );
+    ctx.stroke();
+
+    // ── Right hill mound (sloping up to the right out of the valley) ─────
+    ctx.fillStyle = '#172d0c';
+    ctx.beginPath();
+    ctx.moveTo(DOWNHILL_X2, FLOOR_Y);
+    ctx.bezierCurveTo(DOWNHILL_X2, FLOOR_Y, DOWNHILL_X2 + 10, FLOOR_Y - 20, DOWNHILL_X2 + 40, FLOOR_Y - peakH * 0.2);
+    ctx.bezierCurveTo(DOWNHILL_X2 + 80, FLOOR_Y - peakH * 0.6, DOWNHILL_X2 + 200, FLOOR_Y - peakH - 30, WW, FLOOR_Y - peakH - 30);
+    ctx.lineTo(WW, FLOOR_Y);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = '#2a6614';
+    ctx.beginPath();
+    ctx.moveTo(DOWNHILL_X2, FLOOR_Y);
+    ctx.bezierCurveTo(DOWNHILL_X2, FLOOR_Y, DOWNHILL_X2 + 5, FLOOR_Y - 8, DOWNHILL_X2 + 20, FLOOR_Y - peakH * 0.12);
+    ctx.bezierCurveTo(DOWNHILL_X2 + 60, FLOOR_Y - peakH * 0.5, DOWNHILL_X2 + 180, FLOOR_Y - peakH, WW, FLOOR_Y - peakH);
+    ctx.lineTo(WW, FLOOR_Y);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = '#44b020'; ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(DOWNHILL_X2 + 20, FLOOR_Y - peakH * 0.12);
+    ctx.bezierCurveTo(DOWNHILL_X2 + 60, FLOOR_Y - peakH * 0.5, DOWNHILL_X2 + 180, FLOOR_Y - peakH, WW, FLOOR_Y - peakH);
+    ctx.stroke();
+}
+function drawDownhillSign(){
+    // Road sign at start of downhill section
+    const x=DOWNHILL_X1+20, sy=FLOOR_Y-120;
+    ctx.fillStyle='#888'; ctx.fillRect(x+14,sy+40,6,80);
+    ctx.fillStyle='#ffee00'; ctx.beginPath(); ctx.moveTo(x,sy); ctx.lineTo(x+34,sy); ctx.lineTo(x+34,sy+42); ctx.lineTo(x+17,sy+62); ctx.lineTo(x,sy+42); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle='#aa8800'; ctx.lineWidth=2; ctx.stroke();
+    ctx.fillStyle='#333'; ctx.font='bold 9px monospace'; ctx.textAlign='center';
+    ctx.fillText('DOWN',x+17,sy+18); ctx.fillText('HILL',x+17,sy+30);
+    ctx.fillStyle='#333'; ctx.font='bold 14px monospace'; ctx.fillText('\u2193',x+17,sy+48);
+}
+function drawRoad(){
+    ctx.fillStyle='#777'; ctx.fillRect(0,FLOOR_Y,WW,TILE);
+    // Downhill tint
+    if(downhillIntensity>0){
+        ctx.fillStyle=`rgba(40,20,10,${downhillIntensity*0.25})`;
+        ctx.fillRect(DOWNHILL_X1,FLOOR_Y,DOWNHILL_X2-DOWNHILL_X1,TILE);
+    }
+    // Center lane dashes
+    ctx.fillStyle='#ffee00';
+    for(let x=0;x<WW;x+=88) ctx.fillRect(x+4,FLOOR_Y+13,50,5);
+    // Edge lines
+    ctx.fillStyle='rgba(255,255,255,0.8)'; ctx.fillRect(0,FLOOR_Y,WW,3); ctx.fillRect(0,FLOOR_Y+28,WW,3);
+    // Wide pits
+    WIDE_PITS.forEach(c=>{
+        ctx.fillStyle='#090909'; ctx.fillRect(c*TILE,FLOOR_Y,TILE,TILE);
+        ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(c*TILE,FLOOR_Y,TILE,7);
+    });
+    // Potholes (cracked single-tile holes)
+    POTHOLE_COLS.forEach(c=>{
+        const px=c*TILE, py=FLOOR_Y;
+        // Dark hole
+        ctx.fillStyle='#111'; ctx.beginPath(); ctx.ellipse(px+16,py+14,13,9,0,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle='#000'; ctx.beginPath(); ctx.ellipse(px+16,py+14,9,6,0,0,Math.PI*2); ctx.fill();
+        // Cracks radiating out
+        ctx.strokeStyle='#555'; ctx.lineWidth=1.5;
+        [[16,py,12,py+6],[px+4,py+10,px+12,py+18],[px+28,py+10,px+22,py+18],[px+6,py+22,px+14,py+16]].forEach(([x1,y1,x2,y2])=>{
+            ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+        });
+        // Warning triangle above pothole
+        ctx.fillStyle='#ff4'; ctx.font='bold 10px monospace'; ctx.textAlign='center';
+        ctx.shadowColor='#f80'; ctx.shadowBlur=4; ctx.fillText('\u26a0',px+16,py-4); ctx.shadowBlur=0;
+    });
+}
+function drawGrass(){
+    ctx.fillStyle='#3a6e1e'; ctx.fillRect(0,FLOOR_Y+TILE,WW,WH-FLOOR_Y-TILE);
+    ctx.fillStyle='#4a8a28'; ctx.fillRect(0,FLOOR_Y+TILE,WW,7);
+}
+function drawSchool(){
+    const sx=3260, sy=FLOOR_Y-168;
+    ctx.fillStyle='#e8d9b8'; ctx.fillRect(sx,sy,220,168);
+    ctx.fillStyle='#bb3311';
+    ctx.beginPath(); ctx.moveTo(sx-12,sy); ctx.lineTo(sx+110,sy-55); ctx.lineTo(sx+232,sy); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#88ccff';
+    [[18,16],[64,16],[122,16],[168,16],[18,70],[64,70],[122,70],[168,70]].forEach(([wx,wy])=>{
+        ctx.fillRect(sx+wx,sy+wy,28,28); ctx.strokeStyle='#6699bb'; ctx.lineWidth=2; ctx.strokeRect(sx+wx,sy+wy,28,28);
+        ctx.strokeStyle='rgba(255,255,255,0.5)'; ctx.lineWidth=1;
+        ctx.beginPath(); ctx.moveTo(sx+wx+14,sy+wy); ctx.lineTo(sx+wx+14,sy+wy+28); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(sx+wx,sy+wy+14); ctx.lineTo(sx+wx+28,sy+wy+14); ctx.stroke();
+    });
+    ctx.fillStyle='#7a4010'; ctx.beginPath(); ctx.roundRect(sx+88,sy+112,44,56,[5,5,0,0]); ctx.fill();
+    ctx.fillStyle='#cc9944'; ctx.beginPath(); ctx.arc(sx+125,sy+142,3,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.fillRect(sx+62,sy+100,96,14);
+    ctx.fillStyle='#333'; ctx.font='bold 10px monospace'; ctx.textAlign='center'; ctx.fillText('SCHOOL',sx+110,sy+111);
+    ctx.fillStyle='#ddd'; ctx.fillRect(sx+86,sy-32,48,34);
+    ctx.fillStyle='#bb3311'; ctx.beginPath(); ctx.moveTo(sx+80,sy-30); ctx.lineTo(sx+110,sy-58); ctx.lineTo(sx+140,sy-30); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#FFD700'; ctx.beginPath(); ctx.arc(sx+110,sy-14,9,0,Math.PI); ctx.fill();
+    ctx.fillStyle='#cc8800'; ctx.beginPath(); ctx.arc(sx+110,sy-6,3,0,Math.PI*2); ctx.fill();
+}
+function drawFlagpole(){
+    const px=3530, py=FLOOR_Y-200;
+    // Pole
+    ctx.fillStyle='#aaa'; ctx.fillRect(px,py,5,200);
+    ctx.fillStyle='#ddd'; ctx.fillRect(px+1,py,2,200);
+    // Pennant flag (red triangle)
+    const fw=56, fh=38;
+    ctx.fillStyle='#cc2200';
+    ctx.beginPath(); ctx.moveTo(px+5,py+2); ctx.lineTo(px+5,py+fh); ctx.lineTo(px+5+fw,py+fh/2); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#ff6644';
+    ctx.beginPath(); ctx.moveTo(px+5,py+10); ctx.lineTo(px+5,py+28); ctx.lineTo(px+36,py+fh/2); ctx.closePath(); ctx.fill();
+    // Gold ball on top
+    ctx.fillStyle='#FFD700'; ctx.shadowColor='#FFD700'; ctx.shadowBlur=8;
+    ctx.beginPath(); ctx.arc(px+2,py,7,0,Math.PI*2); ctx.fill();
+    ctx.shadowBlur=0;
+}
+
+// ── Render ───────────────────────────────────────────────────────────────
+function render(){
+    ctx.clearRect(0,0,800,480);
+
+    if(gameState===STATE.TITLE){
+        const bg=ctx.createLinearGradient(0,0,0,480);
+        bg.addColorStop(0,'#1a4499'); bg.addColorStop(0.7,'#3388dd'); bg.addColorStop(1,'#77bbff');
+        ctx.fillStyle=bg; ctx.fillRect(0,0,800,480);
+        drawCloud(100,60); drawCloud(480,45,1.1); drawCloud(660,75,0.85);
+        ctx.fillStyle='#777'; ctx.fillRect(0,380,800,100);
+        ctx.fillStyle='#ff0'; for(let x=0;x<800;x+=88) ctx.fillRect(x+4,393,50,5);
+        ctx.fillStyle='rgba(255,255,255,0.08)'; ctx.beginPath(); ctx.roundRect(100,55,600,310,16); ctx.fill();
+        ctx.strokeStyle='rgba(100,160,255,0.5)'; ctx.lineWidth=2; ctx.beginPath(); ctx.roundRect(100,55,600,310,16); ctx.stroke();
+        ctx.textAlign='center';
+        ctx.shadowColor='#0044cc'; ctx.shadowBlur=15;
+        ctx.font='bold 52px monospace'; ctx.fillStyle='#ffe066'; ctx.fillText("MARIO'S",400,122);
+        ctx.fillStyle='#ff6060'; ctx.fillText("LANDERS",400,176);
+        ctx.shadowBlur=0;
+        ctx.font='20px monospace'; ctx.fillStyle='#99ccff'; ctx.fillText("World 1-3 \u2014 Bike to School",400,218);
+        ctx.font='12px monospace'; ctx.fillStyle='#77aadd';
+        ctx.fillText("Arrows/WASD move \u2003 W/Space jump \u2003 Shift run",400,252);
+        ctx.fillText("Stomp snakes \u2022 Jump rocks & black holes \u2022 Collect bells",400,272);
+        ctx.fillText("Puddles boost your speed \u2022 STOP at the sign \u2022 Avoid potholes",400,292);
+        if(Math.floor(Date.now()/540)%2===0){
+            ctx.font='bold 20px monospace'; ctx.fillStyle='#fff';
+            ctx.shadowColor='#0088ff'; ctx.shadowBlur=10;
+            ctx.fillText('\u25b6  PRESS ENTER TO START  \u25c0',400,340);
+            ctx.shadowBlur=0;
+        }
+        return;
+    }
+
+    ctx.save();
+    ctx.translate(-Math.floor(camera.x),-Math.floor(camera.y));
+
+    drawSky();
+    drawValleyTerrain();
+
+    [[180,80],[460,55,1.2],[820,90,0.9],[1200,60,1.1],[1550,80],[1920,55,1.3],[2400,70],[2800,85],[3200,55,1.1]].forEach(([x,y,s])=>drawCloud(x,y,s||1));
+    [120,380,650,950,1200,1540,1900,2200,2550,2900,3100].forEach(x=>drawTree(x));
+
+    drawGrass();
+    drawRoad();
+    drawDownhillSign();
+    drawSchool();
+    drawFlagpole();
+
+    entities.forEach(e=>e.draw(ctx));
+    if(player) player.draw(ctx);
+
+    particles.forEach(p=>{
+        ctx.globalAlpha=1-p.age/p.life; ctx.fillStyle=p.color;
+        ctx.beginPath(); ctx.arc(p.x,p.y,p.r||3,0,Math.PI*2); ctx.fill();
+    });
+    ctx.globalAlpha=1;
+    ctx.restore();
+
+    // Screen-space speed lines during downhill
+    if(downhillIntensity>0.1 && gameState===STATE.PLAYING){
+        const di=downhillIntensity;
+        ctx.save(); ctx.globalAlpha=di*0.35;
+        ctx.strokeStyle='#fff'; ctx.lineWidth=1.5;
+        const t=Date.now()*0.35;
+        for(let i=0;i<10;i++){
+            const lx=((t*1.8+i*79)%880)-40;
+            const ly=80+i*38;
+            ctx.beginPath(); ctx.moveTo(lx,ly); ctx.lineTo(lx-60*di,ly+6); ctx.stroke();
+        }
+        ctx.restore();
+        // Downhill banner
+        ctx.save(); ctx.globalAlpha=di*0.8;
+        ctx.fillStyle='#ff8800'; ctx.font='bold 15px monospace'; ctx.textAlign='center';
+        ctx.shadowColor='#ff4400'; ctx.shadowBlur=10;
+        ctx.fillText('\u2193 DOWNHILL \u2013 HOLD ON! \u2193',400,60);
+        ctx.shadowBlur=0; ctx.restore();
+    }
+
+    if(gameState===STATE.DYING){ ctx.fillStyle='rgba(0,0,0,0.35)'; ctx.fillRect(0,0,800,480); }
+
+    // ── HUD ──
+    ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,0,800,40);
+    ctx.fillStyle='rgba(255,255,255,0.05)'; ctx.fillRect(0,38,800,2);
+    ctx.font='bold 15px monospace'; ctx.shadowColor='#000'; ctx.shadowBlur=4;
+    ctx.fillStyle='#aaa'; ctx.textAlign='left'; ctx.fillText('MARIO',16,14);
+    ctx.fillStyle='#fff'; ctx.fillText(score.toString().padStart(6,'0'),16,30);
+    ctx.fillStyle='#aaa'; ctx.fillText('BELLS',120,14);
+    ctx.fillStyle='#FFD700'; ctx.beginPath(); ctx.arc(129,25,5,Math.PI,0); ctx.fill(); ctx.fillRect(127,25,4,4);
+    ctx.fillStyle='#fff'; ctx.fillText('\xd7'+String(bellCount).padStart(2,'0'),140,30);
+    ctx.fillStyle='#aaa'; ctx.textAlign='center'; ctx.fillText('WORLD 1-3',400,14);
+    ctx.fillStyle='#fff'; ctx.fillText('Bike to School',400,30);
+    ctx.shadowBlur=0;
+    if(gameState===STATE.WIN){
+        const wg=ctx.createLinearGradient(0,0,0,480);
+        wg.addColorStop(0,'rgba(0,30,100,0.93)'); wg.addColorStop(1,'rgba(0,80,180,0.93)');
+        ctx.fillStyle=wg; ctx.fillRect(0,0,800,480);
+        for(let i=0;i<7;i++) drawStarShape(ctx,57+i*114,(i%2===0?65:110),5,18,8,'#FFD700');
+        ctx.textAlign='center'; ctx.shadowColor='#0066ff'; ctx.shadowBlur=22;
+        ctx.font='bold 46px monospace'; ctx.fillStyle='#ffe066'; ctx.fillText('MARIO MADE IT!',400,148);
+        ctx.shadowBlur=0;
+        ctx.font='22px monospace'; ctx.fillStyle='#fff'; ctx.fillText('He pledges allegiance to the school \ud83c\uddfa\ud83c\uddf8',400,198);
+        ctx.font='20px monospace'; ctx.fillStyle='#aaddff'; ctx.fillText('Score: '+score+'  Bells: '+bellCount,400,242);
+        if(Math.floor(Date.now()/550)%2===0){ ctx.font='18px monospace'; ctx.fillStyle='#88ccff'; ctx.fillText('ENTER \u2014 play again   ESC \u2014 world select',400,306); }
+    }
+}
+</script>
+</body>
+</html>
