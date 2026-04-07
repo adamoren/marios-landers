@@ -74,6 +74,7 @@ window.addEventListener('keydown', e => {
         if (e.code==='Digit3') { window.location.href='https://mario3.apine.net'; }
         if (e.code==='Digit4') { window.location.href='https://mario4.apine.net'; }
         if (e.code==='Digit5') { window.location.href='https://mario5.apine.net'; }
+        if (e.code==='Digit6') { window.location.href='https://mario6.apine.net'; }
         if (e.code==='Escape') gameState=STATE.TITLE;
     }
     if ((gameState===STATE.GAME_OVER||gameState===STATE.WIN) && (e.code==='Enter'||e.code==='Space')) {
@@ -706,9 +707,10 @@ function render(){
             {num:'3',world:'1-3',title:'Bike to School',url:'https://mario3.apine.net',color:'#ff8833'},
             {num:'4',world:'1-4',title:'Deep Sea Swim',url:'https://mario4.apine.net',color:'#22aaff'},
             {num:'5',world:'1-5',title:'Big Top!',url:'https://mario5.apine.net',color:'#ff44cc'},
+            {num:'6',world:'1-6',title:'Koopa Castle',url:'https://mario6.apine.net',color:'#ff6622'},
         ];
         levels.forEach((lv,i)=>{
-            const bx=14+i*156, by=140, bw=142, bh=160;
+            const bx=8+i*132, by=140, bw=120, bh=160;
             ctx.fillStyle='rgba(0,0,0,0.4)';
             ctx.beginPath(); ctx.roundRect(bx,by,bw,bh,12); ctx.fill();
             ctx.strokeStyle=lv.color; ctx.lineWidth=3;
